@@ -10,7 +10,10 @@
     "db": "ponder db",
     "codegen": "ponder codegen",
     "lint": "eslint .",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "test": "node --test 'test/*.test.ts'",
+    "verify": "node scripts/verify.ts",
+    "e2e": "node e2e/run.ts"
   },
   "dependencies": {
     "ponder": "^0.17.8",
@@ -25,6 +28,6 @@
     "typescript": "^5.4.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   }
 }

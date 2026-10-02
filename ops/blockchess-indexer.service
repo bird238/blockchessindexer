@@ -1,0 +1,31 @@
+# Event-sourced Blockchess indexer (Ponder). Adjust User= and the node path to the host
+# (`command -v node`).
+#
+# Recovery model: on any crash systemd restarts the process and Ponder resumes from its last
+# checkpoint (crash recovery). Never delete the database or move START_BLOCK: the indexer
+# performs no historical eth_call, so the full history is always indexable.
+#
+# Storage: PostgreSQL if DATABASE_URL is set in .env.local, otherwise embedded PGlite in
+# /opt/blockchess-indexer/.ponder.
+[Unit]
+Description=Blockchess indexer (Ponder, event-sourced)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blockchess
+WorkingDirectory=/opt/blockchess-indexer
+EnvironmentFile=/opt/blockchess-indexer/.env.local
+ExecStart=/usr/bin/node node_modules/ponder/dist/esm/bin/ponder.js start --schema ${PONDER_SCHEMA} --port 42069
+Restart=always
+RestartSec=10
+# Ponder exposes /health, /ready, /status and /metrics on the same port; proxy only /graphql and
+# /add-table publicly.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/blockchess-indexer
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

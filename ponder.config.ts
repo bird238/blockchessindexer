@@ -4,46 +4,52 @@ import { parseAbiItem } from "viem";
 import { ChessGameFactoryAbi } from "./abis/ChessGameFactoryAbi";
 import { ChessGameTableAbi } from "./abis/ChessGameTableAbi";
 import { ChessEloRegistryAbi } from "./abis/ChessEloRegistryAbi";
+import {
+  CHAIN_ID,
+  ELO_REGISTRY_ADDRESS,
+  ETH_GETLOGS_BLOCK_RANGE,
+  FACTORY_ADDRESS,
+  RPC_URLS,
+  START_BLOCK,
+} from "./src/env";
 
-const factoryAddress = (process.env.FACTORY_ADDRESS ??
-  "0x0000000000000000000000000000000000000000") as `0x${string}`;
-const eloRegistryAddress = (process.env.ELO_REGISTRY_ADDRESS ??
-  "0x0000000000000000000000000000000000000000") as `0x${string}`;
-const startBlock = Number(process.env.START_BLOCK ?? 0);
-
+// Storage: set DATABASE_URL (PostgreSQL) in production; without it Ponder falls back to embedded
+// PGlite, which is fine for local development only (PGLITE_DIR lets tests use their own copy).
 export default createConfig({
+  ...(!process.env.DATABASE_URL && process.env.PGLITE_DIR
+    ? { database: { kind: "pglite" as const, directory: process.env.PGLITE_DIR } }
+    : {}),
   chains: {
     polygon: {
-      id: 137,
-      rpc: process.env.PONDER_RPC_URL_POLYGON ?? "http://127.0.0.1:8545",
+      id: CHAIN_ID,
+      rpc: RPC_URLS,
+      ...(ETH_GETLOGS_BLOCK_RANGE ? { ethGetLogsBlockRange: ETH_GETLOGS_BLOCK_RANGE } : {}),
     },
   },
   contracts: {
     ChessGameFactory: {
       chain: "polygon",
       abi: ChessGameFactoryAbi,
-      address: factoryAddress,
-      startBlock,
+      address: FACTORY_ADDRESS,
+      startBlock: START_BLOCK,
     },
     ChessGameTable: {
       chain: "polygon",
       abi: ChessGameTableAbi,
       address: factory({
-        address: factoryAddress,
+        address: FACTORY_ADDRESS,
         event: parseAbiItem(
           "event TableCreated(address indexed table, uint8 mode, address indexed creator, address frontendRecipient)",
         ),
         parameter: "table",
       }),
-      startBlock,
+      startBlock: START_BLOCK,
     },
-    // Independent, single fixed-address contract -- not deployed
-    // per-table via the factory, so no `factory({...})` address resolution.
     ChessEloRegistry: {
       chain: "polygon",
       abi: ChessEloRegistryAbi,
-      address: eloRegistryAddress,
-      startBlock,
+      address: ELO_REGISTRY_ADDRESS,
+      startBlock: START_BLOCK,
     },
   },
 });

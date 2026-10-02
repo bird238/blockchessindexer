@@ -1,0 +1,14 @@
+# Read-only consistency check: indexer state vs. contracts at the same block (scripts/verify.ts).
+# Never modifies anything. A non-zero exit (1 = divergence, 2 = could not verify, e.g. the indexer
+# is lagging) shows up as a failed unit -- hook OnFailure= to your alerting of choice.
+[Unit]
+Description=Verify Blockchess indexer against on-chain state
+After=blockchess-indexer.service
+
+[Service]
+Type=oneshot
+User=blockchess
+WorkingDirectory=/opt/blockchess-indexer
+EnvironmentFile=/opt/blockchess-indexer/.env.local
+Environment=INDEXER_URL=http://127.0.0.1:42069
+ExecStart=/usr/bin/node scripts/verify.ts

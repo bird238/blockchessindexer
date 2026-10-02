@@ -1,118 +1,190 @@
-import { onchainTable } from "ponder";
+import { index, onchainTable } from "ponder";
+
+// Every row below is derived from event arguments only (see src/logic.ts) -- no historical
+// eth_call -- so any block range can be (re)indexed on an ordinary pruned RPC node. The GraphQL
+// shape blockchess-ui queries (tables / backers / moves / ratings / allowedTokens) is unchanged.
 
 // One row per deployed ChessGameTable clone (Duel/Crowd).
-export const table = onchainTable("table", (t) => ({
-  id: t.hex().primaryKey(), // table contract address
-  mode: t.integer().notNull(), // 0=Duel, 1=Crowd
-  creator: t.hex().notNull(), // msg.sender of the Factory create call
-  frontendRecipient: t.hex().notNull(),
-  createdAtBlock: t.bigint().notNull(),
-  createdAtTimestamp: t.bigint().notNull(),
+export const table = onchainTable(
+  "table",
+  (t) => ({
+    id: t.hex().primaryKey(), // table contract address
+    mode: t.integer().notNull(), // 0=Duel, 1=Crowd
+    creator: t.hex().notNull(), // msg.sender of the Factory create call
+    frontendRecipient: t.hex().notNull(),
+    createdAtBlock: t.bigint().notNull(),
+    createdAtTimestamp: t.bigint().notNull(),
 
-  // static config, read once right after creation
-  baseStake: t.bigint().notNull(),
-  rampPly: t.integer().notNull(),
-  moveTimeout: t.bigint().notNull(),
-  curve: t.integer().notNull(), // 0=Linear, 1=Compound
-  protocolFeeBps: t.integer().notNull(),
-  protocolFeeRecipient: t.hex().notNull(),
-  referralFeeBps: t.integer().notNull(),
-  // address(0) = native currency (POL); any other value is the allowlisted ERC20 this table's
-  // stakes/fees/payouts move in. Frozen at creation (ChessGameTable.initialize), never re-read.
-  token: t.hex().notNull(),
+    // static config (immutable after initialize, except baseStake via StakeIncreaseAccepted)
+    baseStake: t.bigint().notNull(),
+    rampPly: t.integer().notNull(),
+    moveTimeout: t.bigint().notNull(),
+    curve: t.integer().notNull(), // 0=Linear, 1=Compound, 2=Flat
+    compoundRateBps: t.bigint().notNull(), // computed exactly like _computeCompoundRateBps; 0 unless Compound
+    protocolFeeBps: t.integer().notNull(),
+    protocolFeeRecipient: t.hex().notNull(),
+    referralFeeBps: t.integer().notNull(),
+    // address(0) = native currency (POL); otherwise the allowlisted ERC20 of this table.
+    token: t.hex().notNull(),
 
-  // live state, updated on every relevant event
-  status: t.integer().notNull(), // 0=Active, 1=Finished
-  result: t.integer().notNull(), // 0=None, 1=WhiteWon, 2=BlackWon, 3=Draw
-  plyCount: t.integer().notNull(),
-  pot: t.bigint().notNull(),
-  currentStake: t.bigint().notNull(),
-  whiteToMove: t.boolean().notNull(),
-  lastMoveTimestamp: t.bigint().notNull(),
+    // live state, maintained by the event reducers in src/logic.ts
+    status: t.integer().notNull(), // 0=Active, 1=Finished
+    result: t.integer().notNull(), // 0=None, 1=WhiteWon, 2=BlackWon, 3=Draw
+    plyCount: t.integer().notNull(),
+    pot: t.bigint().notNull(),
+    currentStake: t.bigint().notNull(),
+    whiteToMove: t.boolean().notNull(),
+    lastMoveTimestamp: t.bigint().notNull(),
 
-  // Seating (Duel: address(0) = vacancy, filled by whoever makes the first move
-  // for that colour -- see ChessGameTable.makeMove) and Crowd contribution
-  // totals (always 0 for Duel, contract only tracks these in Crowd mode).
-  // Both are public getters on the table contract, read live like everything
-  // else here -- never re-derived off-chain.
-  whitePlayer: t.hex().notNull(),
-  blackPlayer: t.hex().notNull(),
-  totalWhiteContribution: t.bigint().notNull(),
-  totalBlackContribution: t.bigint().notNull(),
-}));
+    // Duel seats (address(0) = vacancy, claimed by the first mover of that colour; never reverted
+    // by a takeback). Always address(0) for Crowd. Crowd contribution totals (always 0 for Duel).
+    whitePlayer: t.hex().notNull(),
+    blackPlayer: t.hex().notNull(),
+    totalWhiteContribution: t.bigint().notNull(),
+    totalBlackContribution: t.bigint().notNull(),
 
-// One row per distinct address that has contributed to one side of a Crowd
-// table. The contract only sums amounts (totalWhiteContribution/
-// totalBlackContribution above) and never counts distinct backers itself, so
-// the lobby's "N backers" figure has to be built here instead. Duel tables
-// never get rows (contribution tracking is Crowd-only on-chain, see
-// ChessGameTable.makeMove's `if (mode == Mode.Crowd)` gate).
-//
-// Known gap (accepted as-is): a row is never removed, so an
-// address whose sole contribution was later fully refunded via a takeback
-// still counts toward "N backers" even though totalWhiteContribution/
-// totalBlackContribution -- the numbers that actually gate payouts via
-// claimShare() -- correctly reflect the refund. Cosmetic-only, narrow (only
-// possible for someone's very first move on a side, undone before any other
-// contribution), not worth the extra per-backer amount tracking it would
-// take to fix.
-export const backer = onchainTable("backer", (t) => ({
-  id: t.text().primaryKey(), // `${tableAddress}-${address}`
-  tableId: t.hex().notNull(),
-  address: t.hex().notNull(),
-  isWhite: t.boolean().notNull(),
-}));
+    // Distinct Crowd backers per side -- lets the lobby show "N backers" without paging through
+    // every backer row (backers(limit: 1000) across all tables stops scaling past 1000 rows).
+    whiteBackerCount: t.integer().notNull(),
+    blackBackerCount: t.integer().notNull(),
 
-// One row per successful move (MoveMade event), including the resulting
-// canonical on-chain state read right after the move -- never recomputed
-// off-chain, to avoid re-implementing chess rules in a second language.
-//
-// `id` is keyed by block/log, NOT by plyIndex: a takeback rolls plyCount back
-// by one on-chain, and a later move can land on that SAME plyIndex again --
-// keying by plyIndex would collide on re-insert. `plyIndex` stays a plain
-// (non-unique) field for ordering/display; `takenBack` marks the row that a
-// later TakebackAccepted undid, instead of deleting it, so the UI can show
-// "this move happened, then got taken back" rather than erasing history.
-export const move = onchainTable("move", (t) => ({
-  id: t.text().primaryKey(), // `${tableAddress}-${blockNumber}-${logIndex}`
-  tableId: t.hex().notNull(),
-  plyIndex: t.integer().notNull(), // 1-based, matches on-chain plyCount after the move
-  mover: t.hex().notNull(),
-  fromSquare: t.integer().notNull(),
-  toSquare: t.integer().notNull(),
-  promotion: t.integer().notNull(),
-  stakePaid: t.bigint().notNull(),
-  blockNumber: t.bigint().notNull(),
-  timestamp: t.bigint().notNull(),
-  txHash: t.hex().notNull(),
-  takenBack: t.boolean().notNull(), // true once a later TakebackAccepted undoes this exact move
+    // Indexer bookkeeping.
+    lastMoveId: t.text(), // latest not-taken-back move (single-level undo target), null if none
+    lastEventBlock: t.bigint().notNull(), // last block that changed this row
+    // "calldata" = config decoded from the factory call; "latest" = factory called through a
+    // wrapper (Safe / 4337 / 7702), config read from the table's getters at the latest block.
+    configSource: t.text().notNull(),
+  }),
+  (t) => ({
+    createdAtBlockIdx: index().on(t.createdAtBlock),
+    statusIdx: index().on(t.status),
+    modeIdx: index().on(t.mode),
+  }),
+);
 
-  // canonical state AFTER this move, read via readContract at this block
-  boardAfter: t.bigint().notNull(), // packed uint256, 4 bits/square
-  castlingRightsAfter: t.integer().notNull(),
-  enPassantAfterSquare: t.integer().notNull(),
-  whiteToMoveAfter: t.boolean().notNull(),
-  halfmoveClockAfter: t.integer().notNull(),
-  currentStakeAfter: t.bigint().notNull(),
-  potAfter: t.bigint().notNull(),
-}));
+// Distinct address that has contributed to one side of a Crowd table. Never removed, even if the
+// address's only contribution is later taken back (cosmetic, accepted; totals stay exact).
+export const backer = onchainTable(
+  "backer",
+  (t) => ({
+    id: t.text().primaryKey(), // `${tableAddress}-${address}`
+    tableId: t.hex().notNull(),
+    address: t.hex().notNull(),
+    isWhite: t.boolean().notNull(),
+  }),
+  (t) => ({
+    tableIdx: index().on(t.tableId),
+  }),
+);
+
+// One row per MoveMade. Keyed by block/log, not plyIndex: after a takeback a later move reuses
+// the same plyIndex. `takenBack` marks the undone row instead of deleting it.
+export const move = onchainTable(
+  "move",
+  (t) => ({
+    id: t.text().primaryKey(), // `${tableAddress}-${blockNumber}-${logIndex}`
+    tableId: t.hex().notNull(),
+    plyIndex: t.integer().notNull(), // 1-based, equals on-chain plyCount after the move
+    mover: t.hex().notNull(),
+    fromSquare: t.integer().notNull(),
+    toSquare: t.integer().notNull(),
+    promotion: t.integer().notNull(),
+    stakePaid: t.bigint().notNull(),
+    blockNumber: t.bigint().notNull(),
+    logIndex: t.integer().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+    takenBack: t.boolean().notNull(),
+
+    // Derived economic/turn state after this move.
+    whiteToMoveAfter: t.boolean().notNull(),
+    currentStakeAfter: t.bigint().notNull(),
+    potAfter: t.bigint().notNull(),
+
+    // Board state after the move used to be read from the contract at the move's block, which
+    // is exactly what required an archive node. No consumer reads these (the UI reads the live
+    // board from the chain), so they are kept only for schema compatibility and left null.
+    boardAfter: t.bigint(),
+    castlingRightsAfter: t.integer(),
+    enPassantAfterSquare: t.integer(),
+    halfmoveClockAfter: t.integer(),
+  }),
+  (t) => ({
+    tableBlockIdx: index().on(t.tableId, t.blockNumber),
+  }),
+);
 
 // Terminal event for a table (checkmate/stalemate/draw/timeout/resign/etc).
-export const gameFinishedEvent = onchainTable("game_finished_event", (t) => ({
-  id: t.text().primaryKey(), // `${tableAddress}-${blockNumber}-${logIndex}`
-  tableId: t.hex().notNull(),
-  result: t.integer().notNull(),
-  triggeredBy: t.hex().notNull(),
-  blockNumber: t.bigint().notNull(),
-  timestamp: t.bigint().notNull(),
-}));
+export const gameFinishedEvent = onchainTable(
+  "game_finished_event",
+  (t) => ({
+    id: t.text().primaryKey(), // `${tableAddress}-${blockNumber}-${logIndex}`
+    tableId: t.hex().notNull(),
+    result: t.integer().notNull(),
+    triggeredBy: t.hex().notNull(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+  }),
+  (t) => ({
+    tableIdx: index().on(t.tableId),
+  }),
+);
 
-// Owner-curated ERC20 allowlist state, fed by ChessGameFactory's TokenAllowlistUpdated event.
-// address(0) (native currency) is never emitted here -- it's always allowed
-// implicitly, both on-chain and in the frontend's token picker. A row with `allowed: false`
-// means the token WAS allowlisted and has since been removed (kept, not deleted, so history is
-// visible) -- existing tables created with it are unaffected either way, see the contract's own
-// NatSpec on setTokenAllowed.
+// Accepted takebacks (Duel two-party accept or Crowd group vote).
+export const takeback = onchainTable(
+  "takeback",
+  (t) => ({
+    id: t.text().primaryKey(), // `${tableAddress}-${blockNumber}-${logIndex}`
+    tableId: t.hex().notNull(),
+    proposer: t.hex().notNull(),
+    accepter: t.hex().notNull(), // Duel: accepting opponent; Crowd: address refunded
+    refunded: t.bigint().notNull(),
+    undoneMoveId: t.text(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+  }),
+  (t) => ({
+    tableIdx: index().on(t.tableId),
+  }),
+);
+
+// Accepted base-stake increases.
+export const stakeIncrease = onchainTable(
+  "stake_increase",
+  (t) => ({
+    id: t.text().primaryKey(),
+    tableId: t.hex().notNull(),
+    newBaseStake: t.bigint().notNull(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+  }),
+  (t) => ({
+    tableIdx: index().on(t.tableId),
+  }),
+);
+
+// Crowd payout claims.
+export const shareClaim = onchainTable(
+  "share_claim",
+  (t) => ({
+    id: t.text().primaryKey(),
+    tableId: t.hex().notNull(),
+    contributor: t.hex().notNull(),
+    amount: t.bigint().notNull(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+  }),
+  (t) => ({
+    tableIdx: index().on(t.tableId),
+    contributorIdx: index().on(t.contributor),
+  }),
+);
+
+// Owner-curated ERC20 allowlist (TokenAllowlistUpdated). address(0) is implicitly allowed and
+// never stored. `allowed: false` = was allowlisted, later removed (kept for history).
 export const allowedToken = onchainTable("allowed_token", (t) => ({
   id: t.hex().primaryKey(), // token address
   allowed: t.boolean().notNull(),
@@ -120,11 +192,8 @@ export const allowedToken = onchainTable("allowed_token", (t) => ({
   updatedAtTimestamp: t.bigint().notNull(),
 }));
 
-// Current ELO rating per player, fed by ChessEloRegistry's RatingUpdated
-// event (Duel-only). A player with no row here is untouched --
-// the registry's own effectiveRating() returns DEFAULT_RATING (1200) for
-// anyone who hasn't finished a recorded game, so the frontend should treat a
-// missing row the same way rather than showing 0/blank.
+// Current ELO rating per player (ChessEloRegistry.RatingUpdated, Duel only). A missing row means
+// the registry's DEFAULT_RATING (1200).
 export const rating = onchainTable("rating", (t) => ({
   id: t.hex().primaryKey(), // player address
   value: t.integer().notNull(),
